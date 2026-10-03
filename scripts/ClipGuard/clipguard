@@ -1,0 +1,316 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# ClipGuard - macOS 系统通用剪贴板守护与自愈工具
+# 功能：定时巡检 sharingd / useractivityd / pboard 状态，发生死锁或异常时自动重置自愈并通知
+# ==============================================================================
+
+set -e
+
+PLIST_NAME="com.midas.clipguard"
+PLIST_PATH="$HOME/Library/LaunchAgents/${PLIST_NAME}.plist"
+LOG_DIR="$HOME/Library/Logs/ClipGuard"
+LOG_FILE="${LOG_DIR}/clipguard.log"
+SCRIPT_PATH="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/$(basename "${BASH_SOURCE[0]}")"
+
+mkdir -p "$LOG_DIR"
+
+log() {
+    local timestamp
+    timestamp=$(date "+%Y-%m-%d %H:%M:%S")
+    echo "[$timestamp] $1" >> "$LOG_FILE"
+}
+
+notify() {
+    local title="$1"
+    local message="$2"
+    osascript -e "display notification \"$message\" with title \"$title\" sound name \"Glass\"" 2>/dev/null || true
+}
+
+# 检查进程是否健康存活
+check_processes() {
+    local missing=0
+    for proc in sharingd useractivityd pboard; do
+        if ! pgrep -x "$proc" >/dev/null 2>&1; then
+            missing=1
+            break
+        fi
+    done
+    return $missing
+}
+
+# 检查剪切板读写响应速度（避免死锁）
+check_pasteboard_responsive() {
+    python3 -c "import subprocess, sys
+try:
+    subprocess.run(['pbpaste'], timeout=2.5, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+    sys.exit(0)
+except Exception:
+    sys.exit(1)
+" >/dev/null 2>&1
+    return $?
+}
+
+# 核心修复逻辑
+do_fix() {
+    local reason="${1:-手动执行修复}"
+    log "执行剪贴板服务重置 (原因: $reason)"
+
+    # 发送优雅终止信号，launchd 会立即拉起新干净实例
+    killall -TERM sharingd useractivityd pboard 2>/dev/null || true
+    sleep 1
+
+    # 确保进程已重新拉起，若未拉起则尝试强杀
+    for proc in sharingd useractivityd pboard; do
+        if ! pgrep -x "$proc" >/dev/null 2>&1; then
+            killall -9 "$proc" 2>/dev/null || true
+        fi
+    done
+
+    # 刷新 Wi-Fi AWDL 接口（不影响正常上网）
+    if command -v networksetup >/dev/null 2>&1; then
+        networksetup -setairportpower en0 on 2>/dev/null || true
+    fi
+
+    log "剪贴板服务已完成重置。"
+}
+
+# 状态诊断命令
+cmd_status() {
+    echo "=================================================="
+    echo "       macOS 系统通用剪贴板 (Universal Clipboard) 诊断    "
+    echo "=================================================="
+
+    echo -n "1. 进程存活检查: "
+    local all_up=1
+    for proc in sharingd useractivityd pboard; do
+        local pid
+        pid=$(pgrep -x "$proc" 2>/dev/null || true)
+        if [ -n "$pid" ]; then
+            echo -n "[$proc: PID $pid] "
+        else
+            echo -n "[$proc: 未运行!] "
+            all_up=0
+        fi
+    done
+    echo ""
+
+    echo -n "2. 剪切板响应探针 (pbpaste): "
+    if check_pasteboard_responsive; then
+        echo "正常 (< 2.5s)"
+    else
+        echo "异常 (超时或卡死)"
+        all_up=0
+    fi
+
+    echo -n "3. 蓝牙状态: "
+    local bt_state
+    bt_state=$(system_profiler SPBluetoothDataType 2>/dev/null | awk -F': ' '/State:/ {print $2; exit}' || echo "未知")
+    echo "$bt_state"
+
+    echo -n "4. Wi-Fi (en0) 状态: "
+    local wifi_state
+    wifi_state=$(networksetup -getairportpower en0 2>/dev/null | awk '{print $4}' || echo "未知")
+    echo "$wifi_state"
+
+    echo -n "5. 接力 (Handoff) 系统配置: "
+    local handoff_ad
+    handoff_ad=$(defaults read -g ActivityAdvertisingAllowed 2>/dev/null || true)
+    if [ "$handoff_ad" != "1" ]; then
+        # 兼容 macOS 新版本保存在 ByHost 目录的情况
+        handoff_ad=$(find ~/Library/Preferences/ByHost -name "com.apple.coreservices.useractivityd.*.plist" -exec plutil -p {} + 2>/dev/null | awk -F'=> ' '/ActivityAdvertisingAllowed/ {print $2}' || echo "")
+    fi
+
+    if [ "$handoff_ad" = "1" ] || [ "$handoff_ad" = "true" ]; then
+        echo "已开启 (Advertising=true)"
+    else
+        echo "未开启或未检测到 (建议前往系统设置->通用->隔空投送与接力确认)"
+    fi
+
+    echo "--------------------------------------------------"
+    if [ $all_up -eq 1 ]; then
+        echo "当前状态检测: 正常"
+    else
+        echo "当前状态检测: 异常 (建议执行 'clipguard fix')"
+    fi
+    echo "=================================================="
+}
+
+# 定时/自动巡检模式（由 LaunchAgent 或 Cron 调用）
+cmd_check() {
+    local is_broken=0
+    local broken_reason=""
+
+    if ! check_processes; then
+        is_broken=1
+        broken_reason="核心守护进程(sharingd/useractivityd/pboard)异常退出"
+    elif ! check_pasteboard_responsive; then
+        is_broken=1
+        broken_reason="系统剪贴板 IPC 响应超时或卡死"
+    fi
+
+    if [ $is_broken -eq 1 ]; then
+        log "检测到异常: $broken_reason"
+        do_fix "$broken_reason"
+        notify "剪贴板同步自愈" "检测到剪贴板同步异常（$broken_reason），已自动重置恢复！"
+    fi
+}
+
+# 手动修复命令
+cmd_fix() {
+    echo "正在重置剪贴板同步服务 (sharingd / useractivityd / pboard)..."
+    do_fix "用户终端手动修复"
+    sleep 1
+    if check_processes && check_pasteboard_responsive; then
+        echo "修复成功！所有守护进程已重新拉起并恢复响应。"
+        notify "剪贴板同步助手" "系统剪贴板同步服务已成功重置！"
+    else
+        echo "部分服务拉起较慢，请稍后再次执行 'clipguard status' 检查。"
+    fi
+}
+
+# 安装 LaunchAgent 后台守护
+cmd_install() {
+    cat <<EOF > "$PLIST_PATH"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>${PLIST_NAME}</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>${SCRIPT_PATH}</string>
+        <string>check</string>
+    </array>
+    <key>StartInterval</key>
+    <integer>300</integer>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StandardOutPath</key>
+    <string>${LOG_DIR}/stdout.log</string>
+    <key>StandardErrorPath</key>
+    <string>${LOG_DIR}/stderr.log</string>
+</dict>
+</plist>
+EOF
+
+    launchctl unload "$PLIST_PATH" 2>/dev/null || true
+    launchctl load "$PLIST_PATH"
+    echo "ClipGuard 自动守护服务已成功安装并启动！"
+    echo "- 巡检周期: 每 5 分钟静默检测一次"
+    echo "- 日志路径: $LOG_FILE"
+    echo "- 配置文件: $PLIST_PATH"
+}
+
+# 卸载 LaunchAgent
+cmd_uninstall() {
+    if [ -f "$PLIST_PATH" ]; then
+        launchctl unload "$PLIST_PATH" 2>/dev/null || true
+        rm -f "$PLIST_PATH"
+        echo "ClipGuard 自动守护服务已卸载。"
+    else
+        echo "未发现已安装的 LaunchAgent 服务。"
+    fi
+}
+
+# 通过 Tailscale (Taildrop) 发送至另一台设备
+cmd_send() {
+    local target="${1:-}"
+    if ! command -v tailscale >/dev/null 2>&1; then
+        echo "错误: 未检测到 tailscale 命令行工具。"
+        return 1
+    fi
+
+    if [ -z "$target" ]; then
+        # 从 Taildrop 目标列表中获取有效远程设备
+        target=$(tailscale file cp --targets 2>/dev/null | awk '{print $2}' | head -n 1 || true)
+        if [ -z "$target" ]; then
+            target="midasgaomacbook-air"
+        fi
+    fi
+
+    echo "正在检查目标设备 ($target) Tailscale 状态..."
+    local status_line
+    status_line=$(tailscale status 2>/dev/null | grep "$target" || true)
+
+    if [ -z "$status_line" ]; then
+        echo "未在 Tailscale 网络中找到目标设备: $target"
+        tailscale file cp --targets
+        return 1
+    fi
+
+    if echo "$status_line" | grep -q "offline"; then
+        echo "提示: 目标设备 '$target' 当前处于离线状态 (可能合盖休眠或未启动 Tailscale)。"
+        echo "Tailscale 状态: $status_line"
+        echo "请点亮/唤醒 MacBook Air 并确保 Tailscale 连接，再执行发送。"
+        return 1
+    fi
+
+    echo "正在通过 Taildrop 发送 $SCRIPT_PATH 到 $target: ..."
+    tailscale file cp "$SCRIPT_PATH" "$target:"
+    echo "发送成功！"
+    echo ""
+    echo "请在目标电脑 ($target) 上运行以下命令接收并部署："
+    echo "  tailscale file get ~/.local/bin/ && chmod +x ~/.local/bin/clipguard && clipguard install"
+}
+
+# 帮助信息
+cmd_help() {
+    echo "用法: clipguard [命令]"
+    echo ""
+    echo "可用命令:"
+    echo "  status       查看当前剪贴板相关服务、蓝牙、Wi-Fi 及响应状态"
+    echo "  fix          立即手动重置剪贴板服务（sharingd, useractivityd, pboard）"
+    echo "  check        执行单次健康巡检，若异常则自动重置并发送系统通知"
+    echo "  install      注册为 macOS 登录后台守护服务 (每 5 分钟自动巡检)"
+    echo "  uninstall    卸载后台守护服务"
+    echo "  send [目标]  通过 Tailscale (Taildrop) 将本脚本发送给另一台 Mac"
+    echo "  notify-test  测试系统通知弹窗"
+    echo ""
+}
+
+INVOKED_NAME="$(basename "$0")"
+
+if [ "$INVOKED_NAME" = "clipfix" ] && [ -z "${1:-}" ]; then
+    cmd_fix
+    exit 0
+fi
+
+case "${1:-}" in
+    status)
+        cmd_status
+        ;;
+    fix)
+        cmd_fix
+        ;;
+    send)
+        shift || true
+        cmd_send "${1:-}"
+        ;;
+    check)
+        cmd_check
+        ;;
+    install)
+        cmd_install
+        ;;
+    uninstall)
+        cmd_uninstall
+        ;;
+    notify-test)
+        notify "剪贴板守护测试" "这是一条测试通知，通知机制正常！"
+        echo "已发送测试通知。"
+        ;;
+    help|--help|-h)
+        cmd_help
+        ;;
+    "")
+        cmd_status
+        echo ""
+        echo "提示: 可运行 'clipguard help' 查看更多命令，或运行 'clipguard fix' 一键修复。"
+        ;;
+    *)
+        echo "未知命令: $1"
+        cmd_help
+        exit 1
+        ;;
+esac
